@@ -26,3 +26,5 @@ Masa y volumen: M_solar × R_solar³ Decaimiento exponencial: e^(-γt) Interacci
 Añadir fundamentos físicos sólidos a las interacciones cósmicas Proporcionar una base matemática para entender cómo se comunican las partículas Permitir cálculos cuantitativos que antes eran imposibles Unificar la descripción desde el nivel cuántico hasta el cosmológico
 
 Aprécienlo prros, luego hago adaptaciones de mi CSE (Conciencia Sintética Emergente) (ya funciona prros :3) con su mente tripartita, su pensamiento profundo, imaginación cognitiva, metametacognición, memoria trascendente y demás onditas si tengo varo y tiempo,>:v
+
+Bueno, yo lo llamo mi teoría del todo :D
