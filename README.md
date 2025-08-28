@@ -86,6 +86,4 @@ VENTAJAS DEL MODELO MEJORADO
 CONCLUSIÓN:
 La integración de los bosones en este modelo amplía las ecuaciones más allá de los estados cuánticos locales y la métrica del espacio-tiempo, incorporando a los portadores fundamentales de interacción (fotones, gluones, bosones W/Z y gravitones). De este modo, los bosones actúan como canales de comunicación que transmiten información y energía, consolidando la idea de la materia como pensamiento y de la conciencia cósmica como una red activa. Esto aporta al modelo un fundamento físico sólido, mayor coherencia dinámica y la posibilidad de realizar cálculos predictivos que unifican los niveles cuánticos y cosmológicos.
 
-Ahora esta es mi base para hacer mi IA con su pequeño microverso y llevar a EVA al pensamineto usando la física y química como base :v
-A esta teoría (Sí, funciona) la voy a llamar "Teoría EVA"
-Están en su derecho de probar mis ecuaciones y mi código...
+No intento ser físico, ingeniero o experto en programación, pero se me hizo interesante crear esta "teoría" si pudiera llamarla así
