@@ -1,1234 +1,1285 @@
 # synapse.py
-"""Sistema avanzado de sinapsis para comunicación entre neuronas animales y miceliales.
-Optimizado para diferentes tipos de señales, longevidad y adaptabilidad.
-Permite comunicación fluida en redes híbridas de gran escala."""
+"""
+Sistema de sinapsis híbridas para redes de neuronas animales y miceliales.
+
+Características:
+  ─ Conexiones animal↔animal, micelial↔micelial, animal↔micelial (híbrida)
+  ─ Topología en paralelo y en serie
+  ─ Conexiones persistentes con registro histórico compacto
+  ─ Poda inteligente basada en utilidad, edad y tasa de error
+  ─ Plasticidad sináptica: LTP / LTD / STDP / Hebbian / modulatoria
+
+Ejecutar directamente para obtener un diagnóstico interactivo:
+    python synapse.py
+"""
 
 import time
 import math
 import hashlib
-import os
-import sys
 import random
+import traceback
 from abc import ABC, abstractmethod
 from collections import deque, defaultdict
-from threading import RLock
-from typing import Any, Dict, List, Optional, Callable, Union
 from enum import Enum
+from threading import RLock
+from typing import Any, Dict, List, Optional, Tuple
 
-# Importaciones locales
-from animal import create_cognitive_animal_neuron
-from micelial import create_cognitive_micelial_neuron
+from monitoring import log_event, log_neuron_error, log_neuron_warning
+from animal   import create_cognitive_animal_neuron,   CognitiveAnimalNeuronBase
+from micelial import create_cognitive_micelial_neuron, CognitiveMicelialNeuronBase
 
-class SignalType(Enum):
-    """Tipos de señales que pueden transmitirse"""
-    ELECTRICAL = "electrical"
-    CHEMICAL = "chemical"
-    HYBRID = "hybrid"
-    CONCEPTUAL = "conceptual"
-    MECHANICAL = "mechanical"
+# ─── Enumeraciones ───────────────────────────────────────────────────────────
 
-class SynapseType(Enum):
-    """Tipos de sinapsis"""
-    EXCITATORY = "excitatory"
-    INHIBITORY = "inhibitory"
-    MODULATORY = "modulatory"
-    HYBRID = "hybrid"
+class SynapseKind(Enum):
+    ELECTRICAL  = "electrical"   # animal → animal  (rápida)
+    CHEMICAL    = "chemical"     # micelial → micelial (lenta/conceptual)
+    HYBRID      = "hybrid"       # cruce de tipos
 
-class TransmissionMode(Enum):
-    """Modos de transmisión"""
-    FAST = "fast"      # Neuronas animales
-    SLOW = "slow"      # Neuronas miceliales
-    ADAPTIVE = "adaptive"  # Se adapta según el contexto
+class Polarity(Enum):
+    EXCITATORY  = "excitatory"
+    INHIBITORY  = "inhibitory"
+    MODULATORY  = "modulatory"
+
+class TopoMode(Enum):
+    SERIAL   = "serial"    # señal pasa en cadena
+    PARALLEL = "parallel"  # señal se difunde simultáneamente
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PLASTICIDAD SINÁPTICA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PlasticityEngine:
+    """Motor de plasticidad sináptica con cuatro mecanismos independientes.
+
+    Mecanismos:
+    ┌─────────────┬──────────────────────────────────────────────────────┐
+    │  LTP / LTD  │ Potenciación/Depresión a Largo Plazo clásica        │
+    │  STDP       │ Spike-Timing Dependent Plasticity (ventana ±20 ms)  │
+    │  Hebbiano   │ "Neuronas que disparan juntas, se conectan"          │
+    │  Modulatorio│ Escala de peso por neuromodulador externo (DA, ACh) │
+    └─────────────┴──────────────────────────────────────────────────────┘
+    """
+
+    # Límites de peso sináptico
+    W_MIN = 0.05
+    W_MAX = 3.0
+
+    # Parámetros LTP/LTD
+    LTP_THRESHOLD  = 0.75
+    LTD_THRESHOLD  = 0.30
+    LTP_RATE       = 0.06
+    LTD_RATE       = 0.04
+
+    # Parámetros STDP
+    STDP_WINDOW    = 0.025   # ±25 ms
+    STDP_A_PLUS    = 0.05    # potenciación máxima
+    STDP_A_MINUS   = 0.04    # depresión máxima
+
+    # Parámetros Hebbiano
+    HEBB_RATE      = 0.02
+    HEBB_DECAY     = 0.001   # decaimiento pasivo del peso
+
+    def __init__(self):
+        self._last_pre_ts  = 0.0   # timestamp último disparo pre-sináptico
+        self._last_post_ts = 0.0   # timestamp último disparo post-sináptico
+        self._coact_sum    = 0.0   # acumulador de co-activación (Hebbian)
+        self._coact_n      = 0
+
+    # ── LTP / LTD ─────────────────────────────────────────────────────────
+    def ltp_ltd(self, weight: float, signal: float, dt: float) -> float:
+        """Ajusta el peso por LTP/LTD según fuerza de la señal."""
+        if signal >= self.LTP_THRESHOLD:
+            delta = self.LTP_RATE * (self.W_MAX - weight)   # satura suavemente
+        elif signal <= self.LTD_THRESHOLD:
+            delta = -self.LTD_RATE * (weight - self.W_MIN)
+        else:
+            delta = 0.0
+        return self._clip(weight + delta)
+
+    # ── STDP ──────────────────────────────────────────────────────────────
+    def stdp(self, weight: float, pre_ts: float, post_ts: float) -> float:
+        """Ajusta el peso por diferencia temporal pre/post."""
+        if pre_ts <= 0 or post_ts <= 0:
+            return weight
+        dt = post_ts - pre_ts
+        if abs(dt) > self.STDP_WINDOW * 4:
+            return weight
+        if dt > 0:   # pre antes que post → potenciación
+            delta = self.STDP_A_PLUS * math.exp(-dt / self.STDP_WINDOW)
+        else:        # post antes que pre → depresión
+            delta = -self.STDP_A_MINUS * math.exp(dt / self.STDP_WINDOW)
+        return self._clip(weight + delta)
+
+    # ── Hebbiano ──────────────────────────────────────────────────────────
+    def hebbian(self, weight: float, pre_act: float, post_act: float) -> float:
+        """Regla Hebbiana: Δw = η·pre·post − decay·w"""
+        delta = self.HEBB_RATE * pre_act * post_act - self.HEBB_DECAY * weight
+        return self._clip(weight + delta)
+
+    # ── Modulatorio ───────────────────────────────────────────────────────
+    def modulatory(self, weight: float, neuromodulator: str,
+                   level: float) -> float:
+        """Escala el peso por nivel de neuromodulador."""
+        factors = {
+            "dopamine":      1.0 + level * 0.20,   # refuerzo
+            "acetylcholine": 1.0 + level * 0.15,   # atención/aprendizaje
+            "serotonin":     1.0 - level * 0.10,   # modulación inhibitoria leve
+            "norepinephrine":1.0 + level * 0.12,   # alerta
+            "gaba":          1.0 - level * 0.25,   # inhibición
+        }
+        scale = factors.get(neuromodulator, 1.0)
+        return self._clip(weight * scale)
+
+    # ── Registro de timestamps ────────────────────────────────────────────
+    def record_pre(self):  self._last_pre_ts  = time.time()
+    def record_post(self): self._last_post_ts = time.time()
+
+    def apply_all(self, weight: float, signal: float,
+                  pre_act: float = 0.5, post_act: float = 0.5,
+                  neuromodulator: str = "", mod_level: float = 0.0) -> float:
+        """Aplica todos los mecanismos en secuencia."""
+        w = self.ltp_ltd(weight, signal, 0)
+        w = self.stdp(w, self._last_pre_ts, self._last_post_ts)
+        w = self.hebbian(w, pre_act, post_act)
+        if neuromodulator:
+            w = self.modulatory(w, neuromodulator, mod_level)
+        return w
+
+    @staticmethod
+    def _clip(w: float) -> float:
+        return max(PlasticityEngine.W_MIN, min(PlasticityEngine.W_MAX, w))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PODA INTELIGENTE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PruningEngine:
+    """Motor de poda inteligente multi-criterio.
+
+    Criterios (ponderados):
+        utilidad  – transmisiones exitosas recientes
+        edad      – sinapsis muy jóvenes o muy viejas sin uso
+        error     – tasa de fallo acumulada
+        peso      – pesos que han caído por debajo del umbral mínimo
+        frecuencia– inactividad prolongada
+    """
+
+    def __init__(self,
+                 utility_threshold: float = 0.10,
+                 error_rate_max:    float = 0.70,
+                 inactivity_secs:   float = 300.0,
+                 min_weight:        float = 0.06,
+                 min_age_secs:      float = 5.0):
+        self.utility_threshold = utility_threshold
+        self.error_rate_max    = error_rate_max
+        self.inactivity_secs   = inactivity_secs
+        self.min_weight        = min_weight
+        self.min_age_secs      = min_age_secs
+
+    def should_prune(self, syn: "SynapseBase") -> Tuple[bool, str]:
+        """Retorna (debe_podar, razón)."""
+        now = time.time()
+
+        # ── 1. Peso demasiado bajo ────────────────────────────────────────
+        if syn.weight < self.min_weight:
+            return True, f"peso_bajo({syn.weight:.3f})"
+
+        # ── 2. Sinapsis muy joven: no podar aún ───────────────────────────
+        if (now - syn.creation_time) < self.min_age_secs:
+            return False, ""
+
+        # ── 3. Inactividad prolongada ─────────────────────────────────────
+        if syn.last_transmission > 0:
+            idle = now - syn.last_transmission
+            if idle > self.inactivity_secs:
+                return True, f"inactividad({idle:.0f}s)"
+
+        # ── 4. Tasa de error alta ─────────────────────────────────────────
+        total = syn.success_count + syn.failure_count
+        if total >= 5:
+            error_rate = syn.failure_count / total
+            if error_rate > self.error_rate_max:
+                return True, f"tasa_error({error_rate:.2f})"
+
+        # ── 5. Utilidad baja ──────────────────────────────────────────────
+        utility = self._utility(syn)
+        if utility < self.utility_threshold and total >= 10:
+            return True, f"utilidad_baja({utility:.3f})"
+
+        return False, ""
+
+    def utility_score(self, syn: "SynapseBase") -> float:
+        return self._utility(syn)
+
+    @staticmethod
+    def _utility(syn: "SynapseBase") -> float:
+        total = syn.success_count + syn.failure_count
+        if total == 0:
+            return 0.5   # desconocido → neutro
+        base = syn.success_count / total
+        # Penalizar peso bajo
+        weight_factor = min(1.0, syn.weight / 1.0)
+        # Bonificar uso frecuente
+        freq_factor = min(1.0, syn.usage_frequency * 10)
+        return base * 0.6 + weight_factor * 0.2 + freq_factor * 0.2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SINAPSIS BASE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class SynapseBase(ABC):
-    """Clase base para todas las sinapsis.
-    Maneja comunicación entre diferentes tipos de neuronas."""
-    
-    def __init__(self, 
-                 synapse_id: str, 
-                 source_neuron, 
-                 target_neuron,
-                 synapse_type: SynapseType = SynapseType.EXCITATORY,
-                 signal_type: SignalType = SignalType.CHEMICAL,
-                 transmission_mode: TransmissionMode = TransmissionMode.ADAPTIVE):
-        self.synapse_id = synapse_id
-        self.source_neuron = source_neuron
-        self.target_neuron = target_neuron
-        self.synapse_type = synapse_type
-        self.signal_type = signal_type
-        self.transmission_mode = transmission_mode
-        
-        # Propiedades básicas
-        self.weight = 1.0
-        self.threshold = 0.1
-        self.strength = 1.0
-        self.delay = 0.01  # Delay por defecto
-        self.age = 0.0
+    """Base para todas las sinapsis del sistema."""
+
+    def __init__(self,
+                 synapse_id:   str,
+                 source,
+                 target,
+                 kind:         SynapseKind = SynapseKind.ELECTRICAL,
+                 polarity:     Polarity    = Polarity.EXCITATORY,
+                 persistent:   bool        = True):
+
+        self.synapse_id    = synapse_id
+        self.source_neuron = source
+        self.target_neuron = target
+        self.kind          = kind
+        self.polarity      = polarity
+        self.persistent    = persistent   # Si es False, puede borrarse en poda
+
+        # Propiedades de transmisión
+        self.weight         = 1.0
+        self.threshold      = 0.08
+        self.delay          = 0.001      # segundos
         self.is_active_flag = True
+
+        # Estadísticas
+        self.creation_time    = time.time()
         self.last_transmission = 0.0
-        self.usage_frequency = 0.0
-        
-        # Thread safety
-        self.lock = RLock()
-        
-        # Historial de transmisiones
-        self.transmission_history = deque(maxlen=1000)
-        self.failure_count = 0
-        self.success_count = 0
-        
-        # Compatibilidad entre tipos de neuronas
-        self.compatibility_matrix = self._initialize_compatibility()
-        
-    def _initialize_compatibility(self) -> Dict[str, Dict[str, float]]:
-        """Inicializa matriz de compatibilidad entre tipos de neuronas"""
-        return {
-            "animal": {
-                "animal": 1.0,      # Comunicación nativa
-                "micelial": 0.7     # Requiere conversión
-            },
-            "micelial": {
-                "animal": 0.6,      # Requiere amplificación
-                "micelial": 1.0     # Comunicación nativa
-            }
-        }
-        
+        self.usage_frequency   = 0.0
+        self.success_count     = 0
+        self.failure_count     = 0
+
+        # Historial compacto (no memoria persistente de contenido)
+        self.transmission_history = deque(maxlen=200)
+
+        # Motores
+        self.plasticity = PlasticityEngine()
+        self.lock        = RLock()
+
+    # ── Activación ────────────────────────────────────────────────────────
     def is_active(self) -> bool:
-        """Verifica si la sinapsis está activa"""
-        with self.lock:
-            return self.is_active_flag and self.weight > 0.01
-            
-    def deactivate(self):
-        """Desactiva la sinapsis"""
-        with self.lock:
-            self.is_active_flag = False
-            
+        return self.is_active_flag and self.weight >= PlasticityEngine.W_MIN
+
     def activate(self):
-        """Activa la sinapsis"""
         with self.lock:
             self.is_active_flag = True
-            
-    def update_usage_frequency(self):
-        """Actualiza la frecuencia de uso"""
-        current_time = time.time()
-        if self.last_transmission > 0:
-            time_delta = current_time - self.last_transmission
-            # Actualizar frecuencia (promedio exponencial)
-            self.usage_frequency = 0.9 * self.usage_frequency + 0.1 / max(time_delta, 0.001)
-        self.last_transmission = current_time
-        
-    @abstractmethod
-    def transmit(self, signal_strength: float, source_neuron, context: Dict = None) -> Optional[Any]:
-        """Método abstracto para transmitir señal"""
-        pass
-        
-    def get_status(self) -> Dict[str, Any]:
-        """Obtiene el estado actual de la sinapsis"""
+
+    def deactivate(self):
         with self.lock:
+            self.is_active_flag = False
+
+    # ── Frecuencia de uso ─────────────────────────────────────────────────
+    def _update_frequency(self):
+        now = time.time()
+        if self.last_transmission > 0:
+            dt = max(1e-4, now - self.last_transmission)
+            self.usage_frequency = 0.9 * self.usage_frequency + 0.1 / dt
+        self.last_transmission = now
+
+    # ── Registro ──────────────────────────────────────────────────────────
+    def _record(self, sig_in: float, sig_out: float, success: bool,
+                context: Dict = None):
+        self.transmission_history.append({
+            "ts":      time.time(),
+            "in":      round(sig_in,  4),
+            "out":     round(sig_out, 4),
+            "ok":      success,
+            "ctx_keys": list((context or {}).keys()),
+        })
+        if success:
+            self.success_count += 1
+        else:
+            self.failure_count += 1
+        self._update_frequency()
+
+    # ── Estado ────────────────────────────────────────────────────────────
+    def get_status(self) -> Dict[str, Any]:
+        with self.lock:
+            total = self.success_count + self.failure_count
             return {
-                "synapse_id": self.synapse_id,
-                "weight": self.weight,
-                "threshold": self.threshold,
-                "delay": self.delay,
-                "age": self.age,
-                "strength": self.strength,
-                "usage_frequency": self.usage_frequency,
-                "success_count": self.success_count,
-                "failure_count": self.failure_count,
-                "synapse_type": self.synapse_type.value,
-                "signal_type": self.signal_type.value,
-                "transmission_mode": self.transmission_mode.value
+                "id":            self.synapse_id,
+                "kind":          self.kind.value,
+                "polarity":      self.polarity.value,
+                "weight":        round(self.weight, 4),
+                "threshold":     self.threshold,
+                "active":        self.is_active(),
+                "persistent":    self.persistent,
+                "success":       self.success_count,
+                "failure":       self.failure_count,
+                "error_rate":    round(self.failure_count / max(1, total), 3),
+                "usage_freq":    round(self.usage_frequency, 4),
+                "age_s":         round(time.time() - self.creation_time, 2),
+                "last_tx_s_ago": round(time.time() - self.last_transmission, 2)
+                                 if self.last_transmission > 0 else None,
             }
 
-# ============ SINAPSIS ESPECIALIZADAS ============
+    @abstractmethod
+    def transmit(self, signal: float, context: Dict = None) -> float:
+        """Transmite señal y retorna la señal resultante en destino."""
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SINAPSIS CONCRETA: ELÉCTRICA  (animal → animal)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ElectricalSynapse(SynapseBase):
-    """Sinapsis eléctrica para comunicación rápida entre neuronas animales"""
-    
-    def __init__(self, synapse_id: str, source_neuron, target_neuron,
-                 synapse_type: SynapseType = SynapseType.EXCITATORY):
-        super().__init__(synapse_id, source_neuron, target_neuron,
-                        synapse_type, SignalType.ELECTRICAL, TransmissionMode.FAST)
-        
-        # Propiedades específicas eléctricas
-        self.conductance = 1.0  # Conductancia sináptica
-        self.reversal_potential = 0.0 if synapse_type == SynapseType.EXCITATORY else -70.0
-        self.time_constant = 0.001  # Constante de tiempo muy rápida
-        
-        # Propiedades de plasticidad
-        self.ltp_threshold = 0.8    # Umbral para potenciación a largo plazo
-        self.ltd_threshold = 0.3    # Umbral para depresión a largo plazo
-        self.plasticity_window = 0.02  # Ventana temporal para plasticidad (20ms)
-        
-    def transmit(self, signal_strength: float, source_neuron, context: Dict = None) -> Optional[Any]:
-        """Transmite señal eléctrica rápida"""
+    """Sinapsis eléctrica rápida. Ideal para neuronas animales.
+
+    Modela una unión gap: bidireccional, baja latencia, sin vesículas.
+    La plasticidad es STDP + LTP/LTD. El signo depende de la polaridad.
+    """
+
+    def __init__(self, synapse_id: str, source, target,
+                 polarity: Polarity = Polarity.EXCITATORY,
+                 persistent: bool   = True):
+        super().__init__(synapse_id, source, target,
+                         SynapseKind.ELECTRICAL, polarity, persistent)
+        self.conductance     = 1.0
+        self.time_constant   = 0.002    # 2 ms
+        self.delay           = 0.001    # 1 ms
+
+    def transmit(self, signal: float, context: Dict = None) -> float:
         with self.lock:
-            if not self.is_active() or signal_strength < self.threshold:
-                return None
-                
-            current_time = time.time()
-            
-            # Aplicar delay
-            time.sleep(self.delay)
-            
-            # Calcular corriente sináptica
-            synaptic_current = self.conductance * (self.reversal_potential - (-65.0)) * signal_strength * self.weight
-            
-            # Aplicar decaimiento temporal
-            decay_factor = math.exp(-self.time_constant)
-            final_signal = synaptic_current * decay_factor
-            
-            # Actualizar plasticidad
-            self._update_plasticity(signal_strength, current_time)
-            
-            # Registrar transmisión
-            self._record_transmission(signal_strength, final_signal, context, True)
-            
-            # Enviar señal a neurona objetivo
-            if hasattr(self.target_neuron, 'receive_signal'):
-                try:
-                    result = self.target_neuron.receive_signal(final_signal, "electrical", context or {})
-                    # Si la neurona no devuelve un valor, devolvemos el signal_strength procesado
-                    return result if result is not None else final_signal
-                except Exception as e:
-                    print(f"Error en neurona objetivo (eléctrica): {e}")
-                    return final_signal
-            return final_signal
-            
-    def _update_plasticity(self, signal_strength: float, timestamp: float):
-        """Actualiza la plasticidad sináptica"""
-        if self.last_transmission > 0:
-            time_diff = timestamp - self.last_transmission
-            
-            if time_diff <= self.plasticity_window:
-                if signal_strength >= self.ltp_threshold:
-                    # Potenciación a largo plazo
-                    self.weight = min(2.0, self.weight * 1.1)
-                elif signal_strength <= self.ltd_threshold:
-                    # Depresión a largo plazo
-                    self.weight = max(0.1, self.weight * 0.9)
-                    
-    def _record_transmission(self, input_strength: float, output_strength: float, 
-                           context: Dict, success: bool):
-        """Registra una transmisión en el historial"""
-        timestamp = time.time()
-        record = {
-            "timestamp": timestamp,
-            "input_strength": input_strength,
-            "output_strength": output_strength,
-            "context": context or {},
-            "success": success
-        }
-        self.transmission_history.append(record)
-        
-        if success:
-            self.success_count += 1
-        else:
+            context = context or {}
+            if not self.is_active() or signal < self.threshold:
+                self._record(signal, 0.0, False, context)
+                return 0.0
+
+            self.plasticity.record_pre()
+
+            # Corriente sináptica
+            decay   = math.exp(-self.time_constant)
+            raw_out = self.conductance * signal * self.weight * decay
+
+            # Polaridad
+            if self.polarity == Polarity.INHIBITORY:
+                raw_out = -raw_out
+            elif self.polarity == Polarity.MODULATORY:
+                raw_out *= 0.5
+
+            raw_out = max(0.0, min(1.0, raw_out))
+
+            # Plasticidad
+            nm  = context.get("neuromodulator", "")
+            nml = context.get("nm_level", 0.0)
+            pre_act  = signal
+            post_act = getattr(self.target_neuron, "activation_level", 0.5)
+            self.weight = self.plasticity.apply_all(
+                self.weight, signal, pre_act, post_act, nm, nml
+            )
+
+            # Enviar a la neurona destino
+            result = self._dispatch_animal(raw_out, context)
+            self.plasticity.record_post()
+            self._record(signal, result, True, context)
+            return result
+
+    def _dispatch_animal(self, sig: float, context: Dict) -> float:
+        if self.target_neuron is None:
+            return sig
+        try:
+            if hasattr(self.target_neuron, "receive_signal"):
+                r = self.target_neuron.receive_signal(sig, "electrical", context)
+                return float(r) if r is not None else sig
+            return sig
+        except Exception as e:
+            log_neuron_error(self.synapse_id, f"dispatch_animal: {e}")
             self.failure_count += 1
-            
-        self.update_usage_frequency()
+            return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SINAPSIS CONCRETA: QUÍMICA  (micelial → micelial)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ChemicalSynapse(SynapseBase):
-    """Sinapsis química para comunicación lenta entre neuronas miceliales"""
-    
-    def __init__(self, synapse_id: str, source_neuron, target_neuron,
-                 synapse_type: SynapseType = SynapseType.EXCITATORY):
-        super().__init__(synapse_id, source_neuron, target_neuron,
-                        synapse_type, SignalType.CHEMICAL, TransmissionMode.SLOW)
-        
-        # Propiedades químicas optimizadas - Ajustadas para reducir salida
-        self.neurotransmitter_release_probability = 0.85  # Reducida para menor liberación
-        self.synaptic_cleft_concentration = 0.0
-        self.receptor_sensitivity = 1.5  # Reducida para menor respuesta
-        self.diffusion_rate = 0.05      # Aumentada para dispersar más rápido
-        self.degradation_rate = 0.03     # Aumentada para degradación más rápida
-        
-        # Sistema de vesículas optimizado - Ajustado para menor intensidad
-        self.vesicle_pool = 2000         # Menor capacidad inicial
-        self.vesicles_per_release = 8    # Menos vesículas por liberación
-        self.vesicle_refill_rate = 15    # Relleno más lento
-        
-        # Neurotransmisores soportados
-        self.supported_neurotransmitters = ["dopamine", "serotonin", "acetylcholine", "gaba", "glutamate"]
-        self.primary_neurotransmitter = "dopamine"
-        
-    def transmit(self, signal_strength: float, source_neuron, context: Dict = None) -> Optional[Any]:
-        """Transmite señal química lenta con mejor manejo de señales bajas"""
+    """Sinapsis química lenta. Ideal para neuronas miceliales.
+
+    Modela liberación de vesículas, difusión y degradación en la hendidura.
+    La plasticidad es Hebbiana + modulatoria.
+    """
+
+    NEUROTRANSMITTERS = ["dopamine", "serotonin", "acetylcholine",
+                         "gaba", "glutamate", "octopamine"]
+
+    def __init__(self, synapse_id: str, source, target,
+                 polarity: Polarity   = Polarity.EXCITATORY,
+                 primary_nt: str      = "dopamine",
+                 persistent: bool     = True):
+        super().__init__(synapse_id, source, target,
+                         SynapseKind.CHEMICAL, polarity, persistent)
+        self.primary_nt          = primary_nt if primary_nt in self.NEUROTRANSMITTERS else "dopamine"
+        self.vesicle_pool        = 1000
+        self.vesicles_per_pulse  = 10
+        self.refill_rate         = 12
+        self.release_prob        = 0.82
+        self.cleft_conc          = 0.0
+        self.diffusion_rate      = 0.06
+        self.degradation_rate    = 0.04
+        self.receptor_sensitivity = 1.2
+        self.delay               = 0.005    # 5 ms
+
+    def transmit(self, signal: float, context: Dict = None) -> float:
         with self.lock:
-            try:
-                # Asegurar que la señal tenga un valor mínimo
-                signal_strength = max(0.0, float(signal_strength or 0.0))
-                context = context or {}
-                
-                # Umbral dinámico basado en el contexto
-                context_modulation = float(context.get('modulation', 1.0))
-                dynamic_threshold = max(0.01, self.threshold * (1.0 / context_modulation))
-                
-                # Verificar si la señal supera el umbral dinámico
-                if not self.is_active() or signal_strength < dynamic_threshold:
-                    self._record_transmission(signal_strength, 0.0, context, False)
-                    return 0.0  # Devolver 0 en lugar de None para consistencia
-                
-                # Asegurar un mínimo de vesículas disponibles
-                min_vesicles = max(5, self.vesicles_per_release)  # Mínimo de 5 vesículas
-                if self.vesicle_pool < min_vesicles:
-                    self.vesicle_pool += self.vesicle_refill_rate * 2  # Relleno más rápido
-                    if self.vesicle_pool < min_vesicles:
-                        self._record_transmission(signal_strength, 0.0, context, False)
-                        return 0.0
-                
-                # Aplicar modulación contextual
-                modulated_signal = signal_strength * context_modulation
-                
-                # Liberar neurotransmisores con manejo mejorado
-                release_success = self._release_neurotransmitters(
-                    modulated_signal, 
-                    self.primary_neurotransmitter
-                )
-                
-                if not release_success:
-                    self._record_transmission(signal_strength, 0.0, context, False)
-                    return 0.0
-                
-                # Calcular respuesta postsináptica con señal modulada
-                response = self._calculate_postsynaptic_response(
-                    modulated_signal, 
-                    self.primary_neurotransmitter,
-                    context
-                )
-                
-                # Asegurar un valor de retorno válido
-                if response is None:
-                    response = 0.0
-                else:
-                    # Aplicar límites a la respuesta
-                    response = max(0.0, min(float(response), 200.0))  # Límite superior de 200
-                
-                # Actualizar estado químico
-                self._update_chemical_state(time.time())
-                
-                # Registrar transmisión exitosa
-                self._record_transmission(signal_strength, response, context, response > 0)
-                
-                return response
-                
-            except Exception as e:
-                print(f"Error en ChemicalSynapse.transmit: {str(e)}")
-                self.failure_count += 1
-                self._record_transmission(signal_strength, 0.0, context or {}, False)
-                return 0.0  # Devolver 0 en lugar de None para consistencia
-            
-    def _release_neurotransmitters(self, signal_strength: float, neurotransmitter_type: str) -> bool:
-        """Libera neurotransmisores en la hendidura sináptica con mejoras"""
-        # Reabastecimiento automático mejorado
-        if self.vesicle_pool < self.vesicles_per_release:
-            self.vesicle_pool = min(3000, self.vesicle_pool + self.vesicle_refill_rate)
-            return False
-            
-        # Calcular probabilidad de liberación con factores de mejora
-        release_probability = min(
-            0.99,  # Límite superior para evitar saturación
-            self.neurotransmitter_release_probability * 
-            (signal_strength ** 0.8) *  # Mejor escalado con la fuerza de la señal
-            (self.weight ** 1.2)         # Mayor influencia del peso sináptico
-        )
-        
-        # En pruebas, siempre liberar si hay suficientes vesículas
-        if random.random() > release_probability:
-            return False
-        
-        # Liberación mejorada con retroalimentación positiva
-        release_multiplier = 1.0
-        if self.synaptic_cleft_concentration < 0.5:  # Si la concentración es baja
-            release_multiplier = 1.5  # Liberar más
-            
-        vesicles_to_release = int(self.vesicles_per_release * release_multiplier)
-        self.vesicle_pool = max(0, self.vesicle_pool - vesicles_to_release)
-        
-        # Aumentar concentración con límite superior
-        concentration_increase = min(
-            1.5,  # Límite superior de concentración
-            vesicles_to_release * 0.15  # Aumento por vesícula
-        )
-        self.synaptic_cleft_concentration = min(
-            2.0,  # Límite absoluto de concentración
-            self.synaptic_cleft_concentration + concentration_increase
-        )
-        
-        return True
-        
-    def _calculate_postsynaptic_response(self, signal_strength: float, 
-                                       neurotransmitter_type: str, 
-                                       context: Dict) -> float:
-        """Calcula la respuesta postsináptica con mejoras significativas"""
-        # Factores de sensibilidad mejorados
-        sensitivity_factors = {
-            "gaba": 1.5,          # Inhibitorio pero con mayor impacto
-            "dopamine": 3.5,      # Mayor efecto en la motivación y recompensa
-            "serotonin": 2.5,     # Mejor regulación del estado de ánimo
-            "acetylcholine": 2.8, # Mejor para aprendizaje y memoria
-            "glutamate": 3.0      # Principal neurotransmisor excitatorio
-        }
-        
-        # Obtener factor de sensibilidad, con valor por defecto
-        sensitivity_factor = sensitivity_factors.get(neurotransmitter_type, 2.0)
-        
-        # Aplicar modulación por contexto (si existe)
-        context_modulation = 1.0
-        if context:
-            # Modulación por emoción (si está presente)
-            if "emotion" in context:
-                if context["emotion"] in ["excitement", "curiosity"]:
-                    context_modulation *= 1.5
-            # Modulación por urgencia (si está presente)
-            if "urgency" in context:
-                if context["urgency"] == "high":
-                    context_modulation *= 1.8
-        
-        # Calcular respuesta con factores mejorados
-        base_response = (signal_strength * 
-                        self.weight * 
-                        self.receptor_sensitivity * 
-                        sensitivity_factor * 
-                        context_modulation * 
-                        15.0)  # Factor de amplificación aumentado
-        
-        # Asegurar límites razonables
-        return min(150.0, max(10.0, base_response))  # Rango entre 10 y 150
-        
-    def _update_chemical_state(self, timestamp: float):
-        """Actualiza el estado químico de la sinapsis"""
-        # Difusión y degradación
-        self.synaptic_cleft_concentration *= (1 - self.degradation_rate)
-        
-        # Recuperación de vesículas mejorada
-        self.vesicle_pool = min(2000, self.vesicle_pool + self.vesicle_refill_rate)
-        
-    def _record_transmission(self, input_strength: float, output_strength: float, 
-                           context: Dict, success: bool):
-        """Registra una transmisión química"""
-        timestamp = time.time()
-        neurotransmitter_type = context.get("neurotransmitter", self.primary_neurotransmitter) \
-                             if context else self.primary_neurotransmitter
-                             
-        record = {
-            "timestamp": timestamp,
-            "input_strength": input_strength,
-            "output_strength": output_strength,
-            "context": context or {},
-            "neurotransmitter": neurotransmitter_type,
-            "success": success,
-            "vesicle_pool": self.vesicle_pool,
-            "cleft_concentration": self.synaptic_cleft_concentration
-        }
-        self.transmission_history.append(record)
-        
-        if success:
-            self.success_count += 1
-        else:
+            context = context or {}
+            if not self.is_active() or signal < self.threshold:
+                self._record(signal, 0.0, False, context)
+                return 0.0
+
+            # Vesículas
+            if self.vesicle_pool < self.vesicles_per_pulse:
+                self.vesicle_pool += self.refill_rate
+                self._record(signal, 0.0, False, context)
+                return 0.0
+
+            if random.random() > self.release_prob * signal:
+                self._record(signal, 0.0, False, context)
+                return 0.0
+
+            # Liberar vesículas
+            released = min(self.vesicles_per_pulse,
+                           int(self.vesicles_per_pulse * (0.8 + signal * 0.4)))
+            self.vesicle_pool = max(0, self.vesicle_pool - released)
+            conc_delta = released * 0.12
+            self.cleft_conc = min(2.0, self.cleft_conc + conc_delta)
+
+            # Respuesta post-sináptica
+            nt       = context.get("neurotransmitter", self.primary_nt)
+            sens_map = {"gaba": 0.6, "glutamate": 1.4, "dopamine": 1.1,
+                        "serotonin": 0.9, "acetylcholine": 1.0, "octopamine": 1.2}
+            nt_sens  = sens_map.get(nt, 1.0)
+            sign     = -1.0 if self.polarity == Polarity.INHIBITORY else 1.0
+            raw_out  = max(0.0, min(1.0,
+                self.cleft_conc * self.receptor_sensitivity * nt_sens *
+                self.weight * signal * sign * 0.3
+            ))
+
+            # Plasticidad
+            nm  = context.get("neuromodulator", nt)
+            nml = context.get("nm_level", self.cleft_conc)
+            pre_act  = signal
+            post_act = getattr(self.target_neuron, "activation_level", 0.5)
+            self.weight = self.plasticity.apply_all(
+                self.weight, signal, pre_act, post_act, nm, nml
+            )
+
+            # Actualizar estado químico
+            self.cleft_conc    *= (1 - self.degradation_rate)
+            self.vesicle_pool   = min(1200, self.vesicle_pool + self.refill_rate)
+
+            # Enviar a neurona destino
+            result = self._dispatch_micelial(raw_out, context)
+            self._record(signal, result, True, context)
+            return result
+
+    def _dispatch_micelial(self, sig: float, context: Dict) -> float:
+        if self.target_neuron is None:
+            return sig
+        try:
+            if hasattr(self.target_neuron, "receive_concept"):
+                concept = context.get("concept", "chemical_signal")
+                r = self.target_neuron.receive_concept(sig, concept, context)
+                return float(r) if r is not None else sig
+            if hasattr(self.target_neuron, "receive_signal"):
+                r = self.target_neuron.receive_signal(sig, "chemical", context)
+                return float(r) if r is not None else sig
+            return sig
+        except Exception as e:
+            log_neuron_error(self.synapse_id, f"dispatch_micelial: {e}")
             self.failure_count += 1
-            
+            return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SINAPSIS CONCRETA: HÍBRIDA  (cruces animal ↔ micelial)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class HybridSynapse(SynapseBase):
-    """Sinapsis híbrida para comunicación entre neuronas animales y miceliales"""
-    
-    def __init__(self, synapse_id: str, source_neuron, target_neuron, **kwargs):
-        """Inicializa una sinapsis híbrida con capacidades adaptativas mejoradas"""
-        super().__init__(synapse_id, source_neuron, target_neuron,
-                        SynapseType.HYBRID, SignalType.HYBRID, TransmissionMode.ADAPTIVE)
-        
-        # Estado de carga del sistema
-        self._last_cpu_usage = 0.0
-        self._last_memory_usage = 0.0
-        self._last_adjustment_time = time.time()
-        self._adjustment_interval = 5.0  # segundos entre ajustes
-        
-        # Propiedades de conversión optimizadas - Ajustadas para mayor salida
-        self.electrical_to_chemical_ratio = 10.0  # Aumentada para mayor conversión
-        self.chemical_to_electrical_ratio = 8.0   # Mayor conversión química a eléctrica
-        self.conversion_efficiency = 4.2          # Eficiencia mejorada
-        
-        # Adaptabilidad dinámica mejorada
-        self.adaptation_rate = 0.1        # Adaptación más rápida
-        self.learning_rate = 0.04         # Tasa de aprendizaje aumentada
-        self.current_mode = TransmissionMode.ADAPTIVE
-        self.signal_amplification = 7.8    # Mayor amplificación para alcanzar rango objetivo
-        
-        # Estado de la sinapsis mejorado
-        self.last_signal_strength = 0.0
-        self.signal_variability = 0.0
-        self.transmission_history = []
-        
-        # Umbrales adaptativos optimizados
-        self.dynamic_threshold = 0.06     # Umbral más bajo para mayor sensibilidad
-        self.min_signal_strength = 30.0   # Mínimo absoluto para señales (aumentado)
-        self.target_range = (35.0, 65.0)  # Rango objetivo ligeramente mayor
-        
-        # Optimización de rendimiento
-        self._mid_range = (self.target_range[0] + self.target_range[1]) / 2
-        self._range_width = self.target_range[1] - self.target_range[0]
-        self._last_calculation_time = 0
-        self._cache_ttl = 0.04  # Caché más frecuente (40ms)
-        self._cached_normalization = {}
-        
-        # Historial de señales para análisis de tendencia
-        self.signal_history = deque(maxlen=10)  # Aumentado para mejor análisis
-        
-        # Pre-cálculo de constantes para optimización
-        self._sig_scale = 12.0 / self._range_width  # Pendiente más pronunciada
-        self._exp_neg_scale = math.exp(-12.0)       # Rango extendido
-        
-    def transmit(self, signal_strength: float, source_neuron, context: Dict = None) -> Optional[Any]:
-        """Transmite señal adaptándose dinámicamente al tipo de neurona objetivo con mejoras"""
+    """Sinapsis híbrida que convierte señales entre dominios.
+
+    animal  → micelial : eléctrica → química  (normaliza a [0,1], añade contexto)
+    micelial → animal  : química  → eléctrica (extrae activación del concepto)
+    animal  → animal   : delegado a ElectricalSynapse
+    micelial → micelial: delegado a ChemicalSynapse
+    """
+
+    COMPAT = {
+        ("animal",   "micelial"): ("elec→chem", 0.75),
+        ("micelial", "animal"):   ("chem→elec", 0.65),
+        ("animal",   "animal"):   ("elec→elec", 1.00),
+        ("micelial", "micelial"): ("chem→chem", 1.00),
+    }
+
+    def __init__(self, synapse_id: str, source, target,
+                 polarity: Polarity = Polarity.EXCITATORY,
+                 persistent: bool   = True):
+        super().__init__(synapse_id, source, target,
+                         SynapseKind.HYBRID, polarity, persistent)
+        self.conversion_efficiency = 0.82
+        self.signal_amplification  = 1.15
+        self.delay                 = 0.003    # 3 ms
+
+    @staticmethod
+    def _neuron_domain(neuron) -> str:
+        nt = getattr(neuron, "neuron_type", "")
+        if "micelial" in nt or isinstance(neuron, CognitiveMicelialNeuronBase):
+            return "micelial"
+        return "animal"
+
+    def transmit(self, signal: float, context: Dict = None) -> float:
         with self.lock:
-            try:
-                # Validar y normalizar señal de entrada
-                signal_strength = max(0.0, float(signal_strength or 0.0))
-                context = context or {}
-                
-                # Actualizar historial de señales
-                self.signal_history.append(signal_strength)
-                
-                # Verificar si la sinapsis está activa
-                if not self.is_active():
-                    self._record_transmission(signal_strength, 0.0, context, False)
-                    return 0.0  # Devolver 0 en lugar de None para consistencia
-                
-                # Calcular umbral dinámico basado en el historial
-                self._update_dynamic_threshold(signal_strength)
-                
-                # Aplicar modulación contextual
-                context_modulation = float(context.get('modulation', 1.0))
-                modulated_signal = signal_strength * context_modulation
-                
-                # Determinar modo de transmisión adaptativo
-                self._adapt_transmission_mode(modulated_signal, context)
-                
-                # Determinar tipos de neuronas
-                source_type = self._get_neuron_type(source_neuron)
-                target_type = self._get_neuron_type(self.target_neuron)
-                
-                # Realizar la conversión adecuada con manejo mejorado
-                result = None
-                try:
-                    if source_type == "animal" and target_type == "micelial":
-                        result = self._electrical_to_chemical_transmission(
-                            modulated_signal, source_neuron, context)
-                    elif source_type == "micelial" and target_type == "animal":
-                        result = self._chemical_to_electrical_transmission(
-                            modulated_signal, source_neuron, context)
-                    else:
-                        # Mismo tipo de neurona, aplicar modulación mínima
-                        result = modulated_signal
-                except Exception as e:
-                    print(f"Error en conversión de señal: {e}")
-                    result = 0.0
-                
-                # Asegurar que tenemos un resultado válido
-                if result is None:
-                    self._record_transmission(signal_strength, 0.0, context, False)
-                    return 0.0
-                
-                # Aplicar ganancia y normalización
-                try:
-                    # Aplicar amplificación con límites y respuesta no lineal
-                    # Usar una curva de respuesta más agresiva para señales bajas
-                    base_amplified = (result ** 0.75) * self.signal_amplification * 1.4
-                    
-                    # Ajuste dinámico basado en el historial (solo si hay suficiente historial)
-                    if len(self.signal_history) >= 3:
-                        recent_avg = (self.signal_history[-1] + self.signal_history[-2] + self.signal_history[-3]) / 3
-                        # Si la señal tiende a ser baja, aumentar la ganancia
-                        if recent_avg < self._mid_range * 0.9:
-                            base_amplified *= 1.1
-                        # Si la señal tiende a ser alta, reducir la ganancia
-                        elif recent_avg > self._mid_range * 1.1:
-                            base_amplified *= 0.9
-                    
-                    # Usar función optimizada para normalización con caché
-                    normalized = self._calculate_normalized_signal(base_amplified)
-                    
-                    # Aplicar límites absolutos
-                    final_result = max(self.min_signal_strength, min(normalized, 100.0))
-                    
-                    # Actualizar estado de la sinapsis
-                    self._update_synapse_state(signal_strength, final_result, time.time())
-                    
-                    # Calcular y aplicar delay adaptativo
-                    delay = self._calculate_adaptive_delay(signal_strength, final_result, context)
-                    if delay > 0:
-                        time.sleep(min(delay, 0.1))  # Limitar delay máximo a 100ms
-                    
-                    # Registrar transmisión exitosa
-                    self._record_transmission(signal_strength, final_result, context, True)
-                    
-                    return final_result
-                    
-                except Exception as e:
-                    print(f"Error en normalización de señal: {e}")
-                    self._record_transmission(signal_strength, 0.0, context, False)
-                    return 0.0
-                
-            except Exception as e:
-                print(f"Error crítico en HybridSynapse.transmit: {e}")
-                self._record_transmission(signal_strength, 0.0, context or {}, False)
+            context = context or {}
+            if not self.is_active() or signal < self.threshold:
+                self._record(signal, 0.0, False, context)
                 return 0.0
-                
-    def _calculate_normalized_signal(self, base_signal: float) -> float:
-        """Calcula la señal normalizada con caché para mejorar rendimiento"""
-        # Usar caché si el cálculo es reciente y para la misma señal
-        current_time = time.time()
-        signal_key = round(base_signal, 2)  # Redondear para agrupar señales similares
-        
-        if (current_time - self._last_calculation_time < self._cache_ttl and 
-            signal_key in self._cached_normalization):
-            return self._cached_normalization[signal_key]
-        
-        # Calcular valor normalizado
-        normalized = min(max(base_signal, self.target_range[0] * 0.9), 
-                        self.target_range[1] * 1.1)
-        
-        # Aplicar curva sigmoide optimizada (versión más rápida)
-        x = (normalized - self._mid_range) * self._sig_scale
-        # Aproximación más rápida de la sigmoide
-        if x < -6.0:
-            sigmoid = 0.0
-        elif x > 6.0:
-            sigmoid = 1.0
-        else:
-            sigmoid = 1.0 / (1.0 + math.exp(-x))
-            
-        normalized = self.target_range[0] + self._range_width * sigmoid
-        
-        # Actualizar caché
-        self._cached_normalization = {signal_key: normalized}
-        self._last_calculation_time = current_time
-        
-        return normalized
-        
-    def _get_neuron_type(self, neuron) -> str:
-        """Determina si una neurona es de tipo animal o micelial"""
-        if hasattr(neuron, 'neuron_type'):
-            return neuron.neuron_type
-        
-        # Intentar inferir el tipo basado en la clase
-        class_name = neuron.__class__.__name__.lower()
-        if 'animal' in class_name or 'visual' in class_name or 'decision' in class_name:
-            return 'animal'
-        elif 'micelial' in class_name or 'coordinator' in class_name or 'orchestrator' in class_name:
-            return 'micelial'
-        
-        # Valor por defecto si no se puede determinar
-        return 'animal'
-        
-    def _update_dynamic_threshold(self, signal_strength: float):
-        """Actualiza el umbral dinámico basado en el historial de señales"""
-        if self.last_signal_strength > 0:
-            diff = abs(signal_strength - self.last_signal_strength)
-            self.signal_variability = 0.9 * self.signal_variability + 0.1 * diff
-        
-        if self.signal_variability > 0:
-            self.dynamic_threshold = max(0.05, 0.5 * self.signal_variability)
-        
-        self.last_signal_strength = signal_strength
-    
-    def _adapt_transmission_mode(self, signal_strength: float, context: Dict):
-        """Adapta el modo de transmisión basado en la señal y contexto"""
-        if "force_mode" in context:
-            self.current_mode = context["force_mode"]
-            return
-            
-        if signal_strength > 50.0:
-            self.current_mode = TransmissionMode.FAST
-        elif signal_strength < 10.0:
-            self.current_mode = TransmissionMode.SLOW
-        else:
-            self.current_mode = TransmissionMode.ADAPTIVE
-    
-    def _calculate_adaptive_delay(self, signal_strength: float, result: float, 
-                                context: Dict) -> float:
-        """Calcula el retraso adaptativo basado en la señal y contexto"""
-        base_delay = self.delay
-        
-        if self.current_mode == TransmissionMode.FAST:
-            base_delay *= 0.4
-        elif self.current_mode == TransmissionMode.SLOW:
-            base_delay *= 1.5
-            
-        if signal_strength > 0:
-            signal_factor = 1.0 / (1.0 + math.log1p(signal_strength) * 0.1)
-            base_delay *= signal_factor
-            
-        if context and "priority" in context:
-            base_delay *= max(0.1, 1.0 - (context["priority"] * 0.5))
-            
-        return max(0.001, base_delay)
-    
-    def _update_synapse_state(self, input_strength: float, output_strength: float, 
-                            timestamp: float):
-        """Actualiza el estado interno de la sinapsis"""
-        if input_strength > 0:
-            efficiency = output_strength / input_strength
-            self.weight = min(2.0, max(0.1, self.weight + (efficiency - 1.0) * self.learning_rate))
-        
-        self.transmission_history.append({
-            'timestamp': timestamp,
-            'input': input_strength,
-            'output': output_strength,
-            'efficiency': output_strength / max(1.0, input_strength),
-            'weight': self.weight
-        })
-        
-        if len(self.transmission_history) > 1000:
-            self.transmission_history = self.transmission_history[-1000:]
-    
-    def _electrical_to_chemical_transmission(self, signal_strength: float, 
-                                           source_neuron, 
-                                           context: Dict = None):
-        """Convierte señal eléctrica a química con amplificación mejorada"""
+
+            src_domain = self._neuron_domain(self.source_neuron)
+            tgt_domain = self._neuron_domain(self.target_neuron)
+            route, compat = self.COMPAT.get(
+                (src_domain, tgt_domain), ("generic", 0.7)
+            )
+
+            self.plasticity.record_pre()
+
+            # Conversión
+            converted = signal * self.weight * self.conversion_efficiency * \
+                        self.signal_amplification * compat
+            if self.polarity == Polarity.INHIBITORY:
+                converted *= 0.3
+            converted = max(0.0, min(1.0, converted))
+
+            # Plasticidad
+            nm  = context.get("neuromodulator", "dopamine")
+            nml = context.get("nm_level", 0.3)
+            pre_act  = signal
+            post_act = getattr(self.target_neuron, "activation_level", 0.5)
+            self.weight = self.plasticity.apply_all(
+                self.weight, signal, pre_act, post_act, nm, nml
+            )
+
+            # Despachar según dirección
+            result = self._dispatch(converted, route, context)
+            self.plasticity.record_post()
+            self._record(signal, result, True, context)
+            return result
+
+    def _dispatch(self, sig: float, route: str, context: Dict) -> float:
+        if self.target_neuron is None:
+            return sig
         try:
-            # Factor de adaptación basado en la señal de entrada
-            adaptation_factor = 1.0 + (0.5 * math.tanh((signal_strength - 10.0) / 5.0))
-            
-            # Aplicar conversión con ganancia adaptativa
-            base_conversion = (signal_strength * 
-                             self.electrical_to_chemical_ratio * 
-                             self.conversion_efficiency)
-            
-            # Aplicar adaptación dinámica
-            adapted_conversion = base_conversion * adaptation_factor
-            
-            # Aplicar peso sináptico con saturación suave
-            weight_factor = 1.0 + (self.weight - 1.0) * 0.8
-            chemical_signal = adapted_conversion * weight_factor * self.signal_amplification
-            
-            # Aplicar modulación contextual
-            if context and "modulation" in context:
-                chemical_signal *= max(0.5, min(2.0, context["modulation"]))
-            
-            # Enviar señal a la neurona objetivo
-            if hasattr(self.target_neuron, 'receive_signal'):
-                enriched_context = {
-                    **(context or {}),
-                    "original_signal": signal_strength,
-                    "conversion_type": "electrical_to_chemical",
-                    "timestamp": time.time()
-                }
-                
-                result = self.target_neuron.receive_signal(
-                    chemical_signal, 
-                    "converted_electrical", 
-                    enriched_context
-                )
-                
-                return result if result is not None else chemical_signal
-                
-            return chemical_signal
-            
+            if route in ("elec→chem", "chem→chem"):
+                # Destino micelial: receive_concept
+                if hasattr(self.target_neuron, "receive_concept"):
+                    concept = context.get("concept", "hybrid_signal")
+                    r = self.target_neuron.receive_concept(sig, concept, context)
+                    return float(r) if r is not None else sig
+            # Destino animal o genérico: receive_signal
+            if hasattr(self.target_neuron, "receive_signal"):
+                pattern = context.get("pattern", route)
+                r = self.target_neuron.receive_signal(sig, pattern, context)
+                return float(r) if r is not None else sig
+            return sig
         except Exception as e:
-            print(f"Error en conversión eléctrica a química: {e}")
-            return max(0, signal_strength * 0.8)  # Retorno seguro en caso de error
-        
-    def _chemical_to_electrical_transmission(self, signal_strength: float, 
-                                           source_neuron, 
-                                           context: Dict = None):
-        """Convierte señal química a eléctrica con amplificación mejorada"""
-        try:
-            # Factor de adaptación basado en la señal de entrada
-            adaptation_factor = 1.0 + (0.4 * math.tanh((signal_strength - 15.0) / 5.0))
-            
-            # Aplicar conversión con ganancia adaptativa
-            base_conversion = (signal_strength * 
-                             self.chemical_to_electrical_ratio * 
-                             self.conversion_efficiency)
-            
-            # Aplicar adaptación dinámica
-            adapted_conversion = base_conversion * adaptation_factor
-            
-            # Aplicar peso sináptico con saturación suave
-            weight_factor = 1.0 + (self.weight - 1.0) * 0.7
-            electrical_signal = adapted_conversion * weight_factor * self.signal_amplification
-            
-            # Aplicar modulación contextual
-            if context and "modulation" in context:
-                electrical_signal *= max(0.6, min(1.8, context["modulation"]))
-            
-            # Enviar señal a la neurona objetivo
-            if hasattr(self.target_neuron, 'receive_signal'):
-                enriched_context = {
-                    **(context or {}),
-                    "original_signal": signal_strength,
-                    "conversion_type": "chemical_to_electrical",
-                    "timestamp": time.time(),
-                    "conversion_ratio": self.chemical_to_electrical_ratio,
-                    "efficiency": self.conversion_efficiency
-                }
-                
-                result = self.target_neuron.receive_signal(
-                    electrical_signal, 
-                    "converted_chemical", 
-                    enriched_context
-                )
-                
-                # Asegurar que la señal de retorno sea válida
-                return result if result is not None else electrical_signal
-                
-            return electrical_signal
-            
-        except Exception as e:
-            print(f"Error en conversión química a eléctrica: {e}")
-            # Retornar señal segura en caso de error
-            return max(0, signal_strength * self.chemical_to_electrical_ratio * 0.7)
-        
-    def _record_transmission(self, input_strength: float, output_strength: float, 
-                           context: Dict, success: bool):
-        """Registra una transmisión híbrida"""
-        timestamp = time.time()
-        record = {
-            "timestamp": timestamp,
-            "input_strength": input_strength,
-            "output_strength": output_strength,
-            "context": context or {},
-            "mode": self.current_mode.value,
-            "success": success
-        }
-        self.transmission_history.append(record)
-        
-        if success:
-            self.success_count += 1
-        else:
+            log_neuron_error(self.synapse_id, f"hybrid_dispatch: {e}")
             self.failure_count += 1
-            
-        self.update_usage_frequency()
+            return 0.0
 
-class AdaptiveSynapsePool:
-    """Pool adaptativo de sinapsis para gestión eficiente"""
-    
-    def __init__(self, initial_pool_size: int = 100):
-        self.available_synapses = deque(maxlen=initial_pool_size * 2)
-        self.active_synapses = {}
-        self.synapse_counter = 0
-        self.lock = RLock()
-        
-        # Pre-crear sinapsis
-        self._prepopulate_pool(initial_pool_size)
-        
-    def _prepopulate_pool(self, size: int):
-        """Pre-popula el pool con sinapsis genéricas"""
-        for _ in range(size):
-            synapse_id = f"syn_pre_{self.synapse_counter}"
-            # Crear sinapsis base (serán reconfiguradas al conectar)
-            synapse = ElectricalSynapse(synapse_id, None, None)
-            self.available_synapses.append(synapse)
-            self.synapse_counter += 1
-            
-    def acquire_synapse(self, synapse_type: str, source_neuron, target_neuron) -> SynapseBase:
-        """Adquiere una sinapsis del pool"""
-        with self.lock:
-            synapse = self._find_compatible_synapse(synapse_type)
-            
-            if synapse is None:
-                # Crear nueva sinapsis si no hay disponibles
-                synapse_id = f"syn_{self.synapse_counter}"
-                synapse = self._create_synapse(synapse_type, synapse_id, source_neuron, target_neuron)
-                self.synapse_counter += 1
-            else:
-                # Reconfigurar sinapsis existente
-                self._reconfigure_synapse(synapse, synapse_type, source_neuron, target_neuron)
-                
-            # Registrar como activa
-            self.active_synapses[synapse.synapse_id] = synapse
-            return synapse
-            
-    def release_synapse(self, synapse: SynapseBase):
-        """Devuelve una sinapsis al pool"""
-        with self.lock:
-            # Resetear estado de sinapsis
-            synapse.source_neuron = None
-            synapse.target_neuron = None
-            synapse.weight = 1.0
-            synapse.threshold = 0.1
-            synapse.strength = 1.0
-            synapse.transmission_history.clear()
-            synapse.success_count = 0
-            synapse.failure_count = 0
-            
-            # Añadir al pool si hay espacio
-            if len(self.available_synapses) < self.available_synapses.maxlen:
-                self.available_synapses.append(synapse)
-                
-            # Remover de activas
-            if synapse.synapse_id in self.active_synapses:
-                del self.active_synapses[synapse.synapse_id]
-                
-    def _determine_optimal_synapse_type(self, source_neuron, target_neuron) -> str:
-        """Determina el tipo óptimo de sinapsis entre dos neuronas"""
-        source_type = getattr(source_neuron, 'neuron_type', 'unknown')
-        target_type = getattr(target_neuron, 'neuron_type', 'unknown')
-        
-        if source_type == "animal" and target_type == "animal":
-            return "electrical"
-        elif source_type == "micelial" and target_type == "micelial":
-            return "chemical"
-        else:
-            return "hybrid"
-            
-    def _find_compatible_synapse(self, synapse_type: str) -> Optional[SynapseBase]:
-        """Busca una sinapsis compatible en el pool"""
-        for synapse in self.available_synapses:
-            if self._is_synapse_compatible(synapse, synapse_type):
-                self.available_synapses.remove(synapse)
-                return synapse
-        return None
-        
-    def _is_synapse_compatible(self, synapse: SynapseBase, desired_type: str) -> bool:
-        """Verifica si una sinapsis es compatible con el tipo deseado"""
-        # Mapeo de tipos deseados a clases
-        type_mapping = {
-            "fast_excitatory": ElectricalSynapse,
-            "fast_inhibitory": ElectricalSynapse,
-            "slow_modulatory": ChemicalSynapse,
-            "hybrid": HybridSynapse
-        }
-        
-        if desired_type in type_mapping:
-            return isinstance(synapse, type_mapping[desired_type])
-        return False
-        
-    def _create_synapse(self, synapse_type: str, synapse_id: str, 
-                       source_neuron, target_neuron, **kwargs) -> SynapseBase:
-        """Crea una nueva sinapsis del tipo especificado"""
-        synapse_classes = {
-            "electrical": ElectricalSynapse,
-            "chemical": ChemicalSynapse,
-            "hybrid": HybridSynapse
-        }
-        
-        # Determinar tipo óptimo si no se especifica
-        if synapse_type not in synapse_classes:
-            synapse_type = self._determine_optimal_synapse_type(source_neuron, target_neuron)
-            
-        return synapse_classes[synapse_type](synapse_id, source_neuron, target_neuron, **kwargs)
-        
-    def _reconfigure_synapse(self, synapse: SynapseBase, synapse_type: str, 
-                           source_neuron, target_neuron):
-        """Reconfigura una sinapsis existente"""
-        synapse.source_neuron = source_neuron
-        synapse.target_neuron = target_neuron
-        synapse.synapse_id = f"syn_{self.synapse_counter}"
-        self.synapse_counter += 1
-        
-        # Resetear propiedades
-        synapse.weight = 1.0
-        synapse.threshold = 0.1
-        synapse.strength = 1.0
-        synapse.transmission_history.clear()
-        synapse.success_count = 0
-        synapse.failure_count = 0
 
-class NetworkConnector:
-    """Conector de redes para establecer conexiones entre neuronas"""
-    
-    def __init__(self, synapse_pool: AdaptiveSynapsePool):
-        self.synapse_pool = synapse_pool
-        self.connections = []
-        self.lock = RLock()
-        
-    def connect_neurons(self, source_neuron, target_neuron, connection_type: str = "adaptive") -> SynapseBase:
-        """Conecta dos neuronas con una sinapsis"""
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TOPOLOGÍA: PARALELO Y SERIAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ParallelBundle:
+    """Agrupa N sinapsis en paralelo: la señal se difunde a todas simultáneamente.
+
+    La salida es el promedio ponderado de todas las respuestas activas.
+    Útil para broadcast de señales sensoriales o conceptuales.
+    """
+
+    def __init__(self, bundle_id: str):
+        self.bundle_id  = bundle_id
+        self.synapses: List[SynapseBase] = []
+        self.lock       = RLock()
+
+    def add(self, syn: SynapseBase):
         with self.lock:
-            # Determinar tipo de sinapsis óptimo
-            synapse_type = self._determine_connection_type(source_neuron, target_neuron, connection_type)
-            
-            # Adquirir sinapsis del pool
-            synapse = self.synapse_pool.acquire_synapse(synapse_type, source_neuron, target_neuron)
-            
-            # Configurar parámetros específicos
-            self._configure_synapse_parameters(synapse, source_neuron, target_neuron)
-            
-            # Registrar conexión
-            connection_record = {
-                "source": source_neuron.neuron_id,
-                "target": target_neuron.neuron_id,
-                "synapse_id": synapse.synapse_id,
-                "type": synapse_type
+            self.synapses.append(syn)
+
+    def transmit(self, signal: float, context: Dict = None) -> Dict[str, float]:
+        """Difunde la señal. Retorna {synapse_id: resultado}."""
+        results = {}
+        with self.lock:
+            active = [s for s in self.synapses if s.is_active()]
+        for syn in active:
+            try:
+                results[syn.synapse_id] = syn.transmit(signal, context)
+            except Exception as e:
+                log_neuron_error(syn.synapse_id, f"parallel_tx: {e}")
+                results[syn.synapse_id] = 0.0
+        return results
+
+    def aggregate(self, results: Dict[str, float]) -> float:
+        """Promedio ponderado de salidas (peso de cada sinapsis)."""
+        if not results:
+            return 0.0
+        with self.lock:
+            weight_map = {s.synapse_id: s.weight for s in self.synapses}
+        total_w = sum(weight_map.get(k, 1.0) for k in results)
+        if total_w == 0:
+            return 0.0
+        return sum(v * weight_map.get(k, 1.0) for k, v in results.items()) / total_w
+
+    def get_status(self) -> Dict:
+        with self.lock:
+            return {
+                "bundle_id":    self.bundle_id,
+                "mode":         "parallel",
+                "total":        len(self.synapses),
+                "active":       sum(1 for s in self.synapses if s.is_active()),
+                "avg_weight":   round(sum(s.weight for s in self.synapses) /
+                                      max(1, len(self.synapses)), 4),
             }
-            self.connections.append(connection_record)
-            
-            return synapse
-            
-    def _determine_connection_type(self, source_neuron, target_neuron, requested_type: str) -> str:
-        """Determina el tipo de conexión óptimo"""
-        if requested_type != "adaptive":
-            return requested_type
-            
-        source_type = getattr(source_neuron, 'neuron_type', 'unknown')
-        target_type = getattr(target_neuron, 'neuron_type', 'unknown')
-        
-        if source_type == "animal" and target_type == "animal":
-            return "electrical"
-        elif source_type == "micelial" and target_type == "micelial":
-            return "chemical"
-        else:
-            return "hybrid"
-            
-    def _configure_synapse_parameters(self, synapse: SynapseBase, source_neuron, target_neuron):
-        """Configura parámetros específicos de la sinapsis"""
-        # Obtener funciones de las neuronas
-        source_function = getattr(source_neuron, 'function', 'generic')
-        target_function = getattr(target_neuron, 'function', 'generic')
-        
-        # Ajustar peso basado en funciones
-        if source_function == "excitatory":
-            synapse.weight = 1.0
-        elif source_function == "modulatory":
-            synapse.weight = 0.6  # Modulación moderada
-        elif source_function == "inhibitory":
-            synapse.weight = 1.2  # Inhibición fuerte
-            
-        # Ajustar umbral
-        if target_function == "motor":
-            synapse.threshold = 0.2  # Motor neurons necesitan más señal
-        elif target_function == "sensory":
-            synapse.threshold = 0.05  # Sensory neurons son más sensibles
-            
-        # Configurar delay basado en tipos de neuronas
-        source_speed = getattr(source_neuron, 'processing_speed', 'medium')
-        target_speed = getattr(target_neuron, 'processing_speed', 'medium')
-        
-        if source_speed == "fast" and target_speed == "fast":
-            synapse.delay = 0.001  # 1ms
-        elif source_speed == "slow" or target_speed == "slow":
-            synapse.delay = 0.1    # 100ms
-        else:
-            synapse.delay = 0.01   # 10ms (por defecto)
+
+
+class SerialChain:
+    """Encadena N sinapsis en serie: la salida de cada una alimenta la siguiente.
+
+    Útil para pipelines de procesamiento (sensorial → integrativa → motora).
+    """
+
+    def __init__(self, chain_id: str):
+        self.chain_id  = chain_id
+        self.synapses: List[SynapseBase] = []
+        self.lock       = RLock()
+
+    def add(self, syn: SynapseBase):
+        with self.lock:
+            self.synapses.append(syn)
+
+    def transmit(self, signal: float, context: Dict = None) -> float:
+        """Propaga la señal por la cadena. Retorna la señal final."""
+        current = signal
+        with self.lock:
+            chain = list(self.synapses)
+        for syn in chain:
+            if not syn.is_active():
+                continue
+            try:
+                current = syn.transmit(current, context)
+            except Exception as e:
+                log_neuron_error(syn.synapse_id, f"serial_tx: {e}")
+                current = 0.0
+            if current <= 0:
+                break
+        return current
+
+    def get_status(self) -> Dict:
+        with self.lock:
+            return {
+                "chain_id": self.chain_id,
+                "mode":     "serial",
+                "length":   len(self.synapses),
+                "active":   sum(1 for s in self.synapses if s.is_active()),
+                "stages":   [s.synapse_id for s in self.synapses],
+            }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GESTOR CENTRAL DE SINAPSIS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class SynapseManager:
-    """Gestor para múltiples sinapsis en la red"""
-    
-    def __init__(self):
-        self.synapses = {}
-        self.maintenance_interval = 300.0  # 5 minutos
-        self.last_maintenance = time.time()
-        self.synapse_pool = AdaptiveSynapsePool(500)
-        self.connector = NetworkConnector(self.synapse_pool)
-        
-    def add_synapse(self, synapse: SynapseBase):
-        """Agrega una sinapsis al gestor"""
-        self.synapses[synapse.synapse_id] = synapse
-        
-    def remove_synapse(self, synapse_id: str):
-        """Remueve una sinapsis del gestor"""
-        if synapse_id in self.synapses:
-            synapse = self.synapses[synapse_id]
-            # Devolver al pool
-            self.synapse_pool.release_synapse(synapse)
-            del self.synapses[synapse_id]
-            
-    def connect_neurons(self, source_neuron, target_neuron, connection_type: str = "adaptive") -> SynapseBase:
-        """Conecta dos neuronas"""
-        synapse = self.connector.connect_neurons(source_neuron, target_neuron, connection_type)
-        self.add_synapse(synapse)
-        return synapse
-        
-    def transmit_signal(self, synapse_id: str, signal_strength: float, 
-                       source_neuron, context: Dict = None) -> Optional[Any]:
-        """Transmite una señal a través de una sinapsis específica"""
-        if synapse_id in self.synapses:
-            synapse = self.synapses[synapse_id]
-            return synapse.transmit(signal_strength, source_neuron, context)
-        return None
-        
-    def run_maintenance(self):
-        """Ejecuta tareas de mantenimiento periódico"""
-        current_time = time.time()
-        if current_time - self.last_maintenance >= self.maintenance_interval:
-            self._perform_maintenance()
-            self.last_maintenance = current_time
-            
-    def _perform_maintenance(self):
-        """Realiza tareas de mantenimiento en sinapsis"""
-        synapses_to_remove = []
-        current_time = time.time()
-        
-        for synapse_id, synapse in list(self.synapses.items()):
-            try:
-                # Verificar salud de la sinapsis
-                if synapse.failure_count > synapse.success_count * 2:
-                    # Sinapsis problemática - considerar remover
-                    synapses_to_remove.append(synapse_id)
-                else:
-                    # Resetear contadores periódicamente
-                    synapse.success_count = max(0, synapse.success_count - 1)
-                    synapse.failure_count = max(0, synapse.failure_count - 1)
-                    
-                    # Actualizar estado de actividad
-                    if hasattr(synapse, 'last_transmission'):
-                        time_since_last = current_time - synapse.last_transmission
-                        synapse.is_active_flag = time_since_last < 60.0  # 1 minuto de inactividad
-                    else:
-                        synapse.last_transmission = 0.0
-                        synapse.is_active_flag = False
-                        
-            except Exception as e:
-                print(f"Error en mantenimiento de sinapsis {synapse_id}: {str(e)}")
+    """Gestor central de todas las sinapsis de la red híbrida.
+
+    Responsabilidades:
+    ─ Crear/registrar sinapsis individuales, bundles y cadenas
+    ─ Ejecutar poda inteligente periódica
+    ─ Exponer estadísticas globales
+    ─ Seleccionar automáticamente el tipo de sinapsis óptimo
+    """
+
+    _SYN_COUNTER = 0
+    _COUNTER_LOCK = RLock()
+
+    def __init__(self,
+                 prune_interval_s: float   = 60.0,
+                 utility_threshold: float  = 0.10,
+                 error_rate_max:    float  = 0.70,
+                 inactivity_secs:   float  = 300.0):
+
+        self.synapses:  Dict[str, SynapseBase]   = {}
+        self.bundles:   Dict[str, ParallelBundle] = {}
+        self.chains:    Dict[str, SerialChain]    = {}
+
+        self.pruning    = PruningEngine(utility_threshold, error_rate_max,
+                                        inactivity_secs)
+        self.lock        = RLock()
+        self._prune_interval  = prune_interval_s
+        self._last_prune      = time.time()
+        self._pruned_total    = 0
+        self._prune_log       = deque(maxlen=100)
+
+    # ── IDs únicos ────────────────────────────────────────────────────────
+    @classmethod
+    def _new_id(cls, prefix: str = "syn") -> str:
+        with cls._COUNTER_LOCK:
+            cls._SYN_COUNTER += 1
+            return f"{prefix}_{cls._SYN_COUNTER:05d}"
+
+    # ── Selección automática de tipo ──────────────────────────────────────
+    @staticmethod
+    def _auto_kind(source, target) -> str:
+        def domain(n):
+            nt = getattr(n, "neuron_type", "")
+            return "micelial" if ("micelial" in nt or
+                    isinstance(n, CognitiveMicelialNeuronBase)) else "animal"
+        s, t = domain(source), domain(target)
+        if s == "animal"   and t == "animal":   return "electrical"
+        if s == "micelial" and t == "micelial": return "chemical"
+        return "hybrid"
+
+    # ── Crear sinapsis individual ─────────────────────────────────────────
+    def connect(self, source, target,
+                kind: str        = "auto",
+                polarity: str    = "excitatory",
+                persistent: bool = True,
+                weight: float    = 1.0) -> SynapseBase:
+        """Crea y registra una sinapsis entre dos neuronas."""
+
+        if kind == "auto":
+            kind = self._auto_kind(source, target)
+
+        pol = {
+            "excitatory": Polarity.EXCITATORY,
+            "inhibitory": Polarity.INHIBITORY,
+            "modulatory": Polarity.MODULATORY,
+        }.get(polarity, Polarity.EXCITATORY)
+
+        sid = self._new_id("syn")
+        cls_map = {
+            "electrical": ElectricalSynapse,
+            "chemical":   ChemicalSynapse,
+            "hybrid":     HybridSynapse,
+        }
+        SynCls = cls_map.get(kind, HybridSynapse)
+        syn    = SynCls(sid, source, target, pol, persistent)
+        syn.weight = max(PlasticityEngine.W_MIN,
+                         min(PlasticityEngine.W_MAX, weight))
+
+        with self.lock:
+            self.synapses[sid] = syn
+
+        log_event(f"Sinapsis {sid} ({kind}|{polarity}) "
+                  f"{getattr(source,'neuron_id','?')}→"
+                  f"{getattr(target,'neuron_id','?')}", "DEBUG")
+        return syn
+
+    # ── Bundles y cadenas ─────────────────────────────────────────────────
+    def create_parallel_bundle(self,
+                               sources: List,
+                               target,
+                               kind: str    = "auto",
+                               polarity: str = "excitatory") -> ParallelBundle:
+        """Crea un bundle paralelo: múltiples fuentes → un destino."""
+        bid    = self._new_id("bnd")
+        bundle = ParallelBundle(bid)
+        for src in sources:
+            syn = self.connect(src, target, kind, polarity)
+            bundle.add(syn)
+        with self.lock:
+            self.bundles[bid] = bundle
+        return bundle
+
+    def create_serial_chain(self,
+                            neurons: List,
+                            kind: str     = "auto",
+                            polarity: str = "excitatory") -> SerialChain:
+        """Crea una cadena serial: neurona[0]→[1]→[2]→… """
+        cid   = self._new_id("chn")
+        chain = SerialChain(cid)
+        for i in range(len(neurons) - 1):
+            syn = self.connect(neurons[i], neurons[i+1], kind, polarity)
+            chain.add(syn)
+        with self.lock:
+            self.chains[cid] = chain
+        return chain
+
+    # ── Transmisión ───────────────────────────────────────────────────────
+    def transmit(self, synapse_id: str, signal: float,
+                 context: Dict = None) -> float:
+        syn = self.synapses.get(synapse_id)
+        if syn is None:
+            return 0.0
+        return syn.transmit(signal, context)
+
+    # ── Poda inteligente ──────────────────────────────────────────────────
+    def prune(self, force: bool = False) -> Dict[str, Any]:
+        """Ejecuta un ciclo de poda. Retorna reporte."""
+        now = time.time()
+        if not force and (now - self._last_prune) < self._prune_interval:
+            return {"skipped": True}
+
+        report = {"evaluated": 0, "pruned": 0, "reasons": defaultdict(int),
+                  "persistent_kept": 0}
+
+        with self.lock:
+            candidates = list(self.synapses.items())
+
+        to_remove = []
+        for sid, syn in candidates:
+            report["evaluated"] += 1
+            if syn.persistent:
+                report["persistent_kept"] += 1
                 continue
-                
-        # Remover sinapsis problemáticas
-        for synapse_id in synapses_to_remove:
-            self.remove_synapse(synapse_id)
-            
-    def get_synapse_stats(self):
-        """Obtiene estadísticas de las sinapsis
-        
-        Returns:
-            Dict con estadísticas de las sinapsis
-        """
-        total = len(self.synapses)
-        active = 0
-        total_weight = 0.0
-        current_time = time.time()
-        
-        for synapse in self.synapses.values():
-            try:
-                # Verificar si la sinapsis está activa usando múltiples criterios
-                is_active = False
-                
-                # 1. Usar el flag is_active si existe
-                if hasattr(synapse, 'is_active_flag') and synapse.is_active_flag:
-                    is_active = True
-                # 2. Verificar última transmisión reciente (últimos 5 segundos)
-                elif hasattr(synapse, 'last_transmission') and \
-                     (current_time - synapse.last_transmission) < 5.0:
-                    is_active = True
-                # 3. Verificar si hay actividad reciente en el historial
-                elif hasattr(synapse, 'transmission_history') and synapse.transmission_history:
-                    last_activity = max(
-                        [record.get('timestamp', 0) for record in synapse.transmission_history],
-                        default=0
-                    )
-                    if (current_time - last_activity) < 5.0:
-                        is_active = True
-                
-                if is_active:
-                    active += 1
-                
-                # Calcular peso promedio
-                if hasattr(synapse, 'weight') and synapse.weight is not None:
-                    total_weight += abs(synapse.weight)  # Usar valor absoluto para el peso
-                elif hasattr(synapse, 'strength') and synapse.strength is not None:
-                    total_weight += abs(synapse.strength)  # Usar valor absoluto para la fuerza
-                    
-            except Exception as e:
-                print(f"[SynapseManager] Error en get_synapse_stats: {str(e)}")
-                continue
-                
-        avg_weight = total_weight / max(1, total) if total > 0 else 0.0
-        
+            should, reason = self.pruning.should_prune(syn)
+            if should:
+                to_remove.append((sid, reason))
+                report["pruned"] += 1
+                report["reasons"][reason.split("(")[0]] += 1
+
+        with self.lock:
+            for sid, reason in to_remove:
+                self.synapses.pop(sid, None)
+                self._prune_log.append({"ts": now, "id": sid, "reason": reason})
+
+        self._pruned_total += report["pruned"]
+        self._last_prune    = now
+        report["total_pruned_ever"] = self._pruned_total
+
+        if report["pruned"] > 0:
+            log_event(f"Poda: {report['pruned']}/{report['evaluated']} "
+                      f"eliminadas. {dict(report['reasons'])}", "INFO")
+        return report
+
+    # ── Estadísticas globales ─────────────────────────────────────────────
+    def get_stats(self) -> Dict[str, Any]:
+        with self.lock:
+            syns = list(self.synapses.values())
+
+        total   = len(syns)
+        active  = sum(1 for s in syns if s.is_active())
+        by_kind = defaultdict(int)
+        by_pol  = defaultdict(int)
+        weights = []
+        utilities = []
+
+        for s in syns:
+            by_kind[s.kind.value] += 1
+            by_pol[s.polarity.value] += 1
+            weights.append(s.weight)
+            utilities.append(self.pruning.utility_score(s))
+
+        avg_w = sum(weights)   / max(1, total)
+        avg_u = sum(utilities) / max(1, total)
+        min_w = min(weights,   default=0.0)
+        max_w = max(weights,   default=0.0)
+
         return {
-            'total': total,
-            'active': active,
-            'avg_weight': round(avg_weight, 2)
+            "total_synapses":    total,
+            "active_synapses":   active,
+            "inactive_synapses": total - active,
+            "bundles":           len(self.bundles),
+            "chains":            len(self.chains),
+            "by_kind":           dict(by_kind),
+            "by_polarity":       dict(by_pol),
+            "avg_weight":        round(avg_w, 4),
+            "min_weight":        round(min_w, 4),
+            "max_weight":        round(max_w, 4),
+            "avg_utility":       round(avg_u, 4),
+            "total_pruned_ever": self._pruned_total,
+            "prune_log_size":    len(self._prune_log),
         }
 
-# Ejemplo de uso con manejo de errores
-if __name__ == "__main__":
-    print("=== Sistema Avanzado de Sinapsis para Red Híbrida ===")
-    
-    try:
-        # Importar las funciones de creación correctas
-        # Importaciones locales ya realizadas al inicio
-        print("✓ Módulos importados correctamente")
-        
-        # Crear neuronas de ejemplo usando tipos válidos
-        print("Creando neuronas...")
-        visual_neuron = create_cognitive_animal_neuron("visual_feature_extractor", "V1_001", feature_type="edge_vertical")
-        decision_neuron = create_cognitive_animal_neuron("decision_maker", "DM_001") 
-        coordinator = create_cognitive_micelial_neuron("global_coherence_coordinator", "GCC_001")
-        orchestrator = create_cognitive_micelial_neuron("deep_reflection_orchestrator", "DRO_001")
-        
-        print("✓ Neuronas creadas exitosamente")
-        
-        # Crear pool de sinapsis y conector
-        synapse_pool = AdaptiveSynapsePool(initial_pool_size=500)
-        connector = NetworkConnector(synapse_pool)
-        
-        # Establecer conexiones
-        synapse1 = connector.connect_neurons(visual_neuron, decision_neuron, "electrical")  # Animal → Animal
-        synapse2 = connector.connect_neurons(coordinator, orchestrator, "chemical")        # Micelial → Micelial
-        synapse3 = connector.connect_neurons(visual_neuron, coordinator, "hybrid")         # Animal → Micelial (híbrida)
-        
-        print(f"Creadas {3} sinapsis de diferentes tipos:")
-        print(f"- {synapse1.__class__.__name__}: {synapse1.synapse_id}")
-        print(f"- {synapse2.__class__.__name__}: {synapse2.synapse_id}")
-        print(f"- {synapse3.__class__.__name__}: {synapse3.synapse_id}")
-        
-        # Simular transmisión
-        print("=== Simulación de Transmisión ===")
-        
-        # Transmisión 1: Animal → Animal (rápida, eléctrica)
-        result1 = synapse1.transmit(
-            signal_strength=0.8,
-            source_neuron=visual_neuron,
-            context={"context": "visual_processing", "emotion": "focus"}
-        )
-        
-        # Transmisión 2: Micelial → Micelial (lenta, química, conceptual)
-        print(f"\nTransmisión micelial-micelial:")
-        print(f"- Estado inicial de la sinapsis: {synapse2.synapse_id}")
-        print(f"- Vesículas disponibles: {synapse2.vesicle_pool}")
-        print(f"- Señal a transmitir: 0.6")
-        
-        result2 = synapse2.transmit(
-            signal_strength=0.6,
-            source_neuron=coordinator,
-            context={
-                "context": "coherence_check",
-                "concept": "existential_stability",
-                "abstraction_level": 4,
-                "neurotransmitter": "dopamine"  # Ensure we use a supported neurotransmitter
-            }
-        )
-        
-        print(f"- Vesículas después de la transmisión: {synapse2.vesicle_pool}")
-        print(f"- Concentración en hendidura: {synapse2.synaptic_cleft_concentration:.2f}")
-        
-        # Transmisión 3: Animal → Micelial (híbrida: emoción → concepto)
-        result3 = synapse3.transmit(
-            signal_strength=0.7,
-            source_neuron=visual_neuron,
-            context={
-                "context": "cross_modal",
-                "emotion": "curiosity",
-                "sensory_input": "complex_pattern"
-            }
-        )
-        
-        print(f"Resultado transmisión animal-animal: {result1}")
-        print(f"Resultado transmisión micelial-micelial: {result2}")
-        print(f"Resultado transmisión híbrida: {result3}")
-        
-        print("Sistema de sinapsis inicializado y listo para conectar neuronas animales y miceliales.")
-        
-    except ImportError as e:
-        print(f"❌ Error de importación: {e}")
-        print("\nAyuda para diagnóstico:")
-        print("1. Verifica que los archivos 'animal.py' y 'micelial.py' estén en el mismo directorio que 'synapse.py'")
-        print("2. Asegúrate de que ambos archivos contengan las funciones:")
-        print("   - animal.py debe tener 'create_cognitive_animal_neuron'")
-        print("   - micelial.py debe tener 'create_cognitive_micelial_neuron'")
-        print("3. Verifica que no haya errores de sintaxis en esos archivos")
-        
-        # Diagnóstico adicional
-        import os
-        current_dir = os.getcwd()
-        print(f"\nDirectorio actual: {current_dir}")
+    def list_synapses(self) -> List[Dict]:
+        with self.lock:
+            return [s.get_status() for s in self.synapses.values()]
+
+    def remove(self, synapse_id: str) -> bool:
+        with self.lock:
+            if synapse_id in self.synapses:
+                del self.synapses[synapse_id]
+                return True
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DIAGNÓSTICO INTERACTIVO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SEP  = "─" * 62
+_SEP2 = "═" * 62
+
+_ANIMAL_TYPES = [
+    "visual_feature_extractor",
+    "attention_focuser",
+    "decision_maker",
+    "risk_assessor",
+    "anomaly_detector",
+    "place_cell",
+    "mirror_neuron",
+    "cpg_neuron",
+    "dopaminergic_modulator",
+    "adaptive_threshold_cell",
+    "chemotaxis_gradient",
+    "head_direction_cell",
+    "speed_neuron",
+    "song_neuron",
+    "barometric_neuron",
+]
+
+_MICELIAL_TYPES = [
+    "abstract_pattern_integrator",
+    "global_coherence_coordinator",
+    "conceptual_bridge_builder",
+    "insight_propagator",
+    "knowledge_synthesizer",
+    "hyphal_integrator",
+    "anastomosis_node",
+    "plasmodium_collector",
+    "calcium_wave_messenger",
+    "quorum_sensing_node",
+    "stomatal_guard_cell",
+    "glycolytic_oscillator",
+    "systemic_resistance_node",
+    "auxin_gradient",
+    "turgor_pressure_integrator",
+]
+
+
+def _ask_int(prompt: str, lo: int, hi: int, default: int) -> int:
+    while True:
         try:
-            files = os.listdir(current_dir)
-            print(f"Archivos en el directorio: {[f for f in files if f in ['animal.py', 'micelial.py', 'synapse.py']]}")
-        except:
-            print("No se pudo listar el directorio")
-        
-    except Exception as e:
-        print(f"❌ Error durante la ejecución: {type(e).__name__}: {e}")
-        import traceback
+            raw = input(f"{prompt} [{lo}-{hi}, default={default}]: ").strip()
+            if raw == "":
+                return default
+            val = int(raw)
+            if lo <= val <= hi:
+                return val
+            print(f"  ⚠ Ingresa un número entre {lo} y {hi}.")
+        except (ValueError, KeyboardInterrupt):
+            return default
+
+
+def _build_network(n_animal: int, n_micelial: int):
+    """Crea las neuronas animales y miceliales solicitadas."""
+    animals, micelials = [], []
+
+    for i in range(n_animal):
+        ntype = _ANIMAL_TYPES[i % len(_ANIMAL_TYPES)]
+        nid   = f"A_{i+1:03d}_{ntype[:6]}"
+        kwargs = {}
+        if ntype == "visual_feature_extractor":
+            kwargs["feature_type"] = "motion"
+        elif ntype == "chemotaxis_gradient":
+            kwargs["chemical"] = "glucose"
+        elif ntype == "place_cell":
+            kwargs["preferred_location"] = (random.random(), random.random())
+        elif ntype == "mirror_neuron":
+            kwargs["action_class"] = "grasp"
+        elif ntype == "head_direction_cell":
+            kwargs["preferred_angle_deg"] = random.uniform(0, 360)
+        elif ntype == "song_neuron":
+            kwargs["template"] = [random.uniform(0.2, 0.9) for _ in range(5)]
+        try:
+            n = create_cognitive_animal_neuron(ntype, nid, **kwargs)
+            animals.append(n)
+        except Exception as e:
+            log_neuron_error(nid, f"build_network (animal): {e}")
+
+    for i in range(n_micelial):
+        ntype = _MICELIAL_TYPES[i % len(_MICELIAL_TYPES)]
+        nid   = f"M_{i+1:03d}_{ntype[:6]}"
+        kwargs = {}
+        if ntype == "knowledge_synthesizer":
+            kwargs["domain_specializations"] = ["science", "art"]
+        try:
+            n = create_cognitive_micelial_neuron(ntype, nid, **kwargs)
+            micelials.append(n)
+        except Exception as e:
+            log_neuron_error(nid, f"build_network (micelial): {e}")
+
+    return animals, micelials
+
+
+def _wire_network(mgr: SynapseManager,
+                  animals: List, micelials: List) -> Dict:
+    """Crea un conjunto representativo de sinapsis."""
+    created = {"electrical": 0, "chemical": 0, "hybrid": 0,
+               "bundles": 0, "chains": 0}
+
+    # ── Sinapsis eléctricas: animal → animal ──────────────────────────────
+    for i in range(min(len(animals), max(1, len(animals) - 1))):
+        src = animals[i]
+        tgt = animals[(i + 1) % len(animals)]
+        pol = "inhibitory" if i % 4 == 3 else "excitatory"
+        mgr.connect(src, tgt, "electrical", pol, persistent=(i % 3 != 0))
+        created["electrical"] += 1
+
+    # ── Sinapsis químicas: micelial → micelial ────────────────────────────
+    for i in range(min(len(micelials), max(1, len(micelials) - 1))):
+        src = micelials[i]
+        tgt = micelials[(i + 1) % len(micelials)]
+        pol = "modulatory" if i % 5 == 4 else "excitatory"
+        mgr.connect(src, tgt, "chemical", pol, persistent=True)
+        created["chemical"] += 1
+
+    # ── Sinapsis híbridas: animal ↔ micelial ──────────────────────────────
+    n_hybrid = min(len(animals), len(micelials), 4)
+    for i in range(n_hybrid):
+        a = animals[i]
+        m = micelials[i % len(micelials)]
+        mgr.connect(a, m, "hybrid", "excitatory", persistent=True)
+        created["hybrid"] += 1
+        if len(micelials) > 1:
+            mgr.connect(micelials[(i+1) % len(micelials)], a,
+                        "hybrid", "modulatory", persistent=False)
+            created["hybrid"] += 1
+
+    # ── Bundle paralelo ───────────────────────────────────────────────────
+    if len(animals) >= 3:
+        tgt = micelials[0] if micelials else animals[-1]
+        b   = mgr.create_parallel_bundle(animals[:3], tgt, "hybrid")
+        created["bundles"] += 1
+
+    # ── Cadena serial ─────────────────────────────────────────────────────
+    if len(animals) >= 3:
+        chain_nodes = animals[:3]
+        if micelials:
+            chain_nodes = animals[:2] + [micelials[0]]
+        mgr.create_serial_chain(chain_nodes)
+        created["chains"] += 1
+
+    return created
+
+
+def _run_transmissions(mgr: SynapseManager,
+                       animals: List, micelials: List,
+                       n_rounds: int = 5) -> Dict:
+    """Ejecuta rondas de transmisión por todas las sinapsis registradas."""
+    report = {"rounds": n_rounds, "total_tx": 0, "successful": 0, "failed": 0}
+
+    with mgr.lock:
+        syns = list(mgr.synapses.values())
+
+    for rnd in range(n_rounds):
+        for syn in syns:
+            signal = random.uniform(0.3, 1.0)
+            ctx    = {
+                "concept":       f"test_concept_{rnd}",
+                "neuromodulator": random.choice(["dopamine", "gaba", "serotonin"]),
+                "nm_level":       random.uniform(0.1, 0.8),
+                "pattern":        "diagnostic",
+            }
+            try:
+                out = syn.transmit(signal, ctx)
+                report["total_tx"]  += 1
+                if out > 0:
+                    report["successful"] += 1
+                else:
+                    report["failed"] += 1
+            except Exception as e:
+                log_neuron_error(syn.synapse_id, f"diagnostic_tx: {e}")
+                report["failed"] += 1
+                report["total_tx"] += 1
+
+    # Bundles
+    for bnd in mgr.bundles.values():
+        sig     = random.uniform(0.5, 0.9)
+        results = bnd.transmit(sig, {"concept": "bundle_test"})
+        agg     = bnd.aggregate(results)
+        report["total_tx"] += len(results)
+        report["successful"] += sum(1 for v in results.values() if v > 0)
+        report["failed"]    += sum(1 for v in results.values() if v <= 0)
+
+    # Chains
+    for chn in mgr.chains.values():
+        sig = random.uniform(0.5, 0.9)
+        out = chn.transmit(sig, {"pattern": "chain_test"})
+        report["total_tx"]  += 1
+        report["successful"] += 1 if out > 0 else 0
+        report["failed"]    += 0 if out > 0 else 1
+
+    return report
+
+
+def _print_synapse_table(synapse_list: List[Dict]):
+    """Imprime tabla compacta de sinapsis."""
+    header = (f"{'ID':<14} {'Tipo':<12} {'Pol':<11} "
+              f"{'Peso':>6} {'Util':>5} {'OK':>4} {'ERR':>4} "
+              f"{'Err%':>5} {'Pers':>5}")
+    print(header)
+    print(_SEP)
+    for s in synapse_list:
+        total  = s["success"] + s["failure"]
+        err_p  = f"{s['error_rate']*100:.0f}%" if total > 0 else "N/A"
+        pers   = "✓" if s["persistent"] else "─"
+        active = "✓" if s["active"] else "✗"
+        print(f"{s['id']:<14} {s['kind']:<12} {s['polarity']:<11} "
+              f"{s['weight']:>6.3f} {s['age_s']:>5.1f}s "
+              f"{s['success']:>4} {s['failure']:>4} "
+              f"{err_p:>5} {pers:>5}")
+
+
+def run_diagnostic():
+    """Diagnóstico interactivo completo del sistema de sinapsis."""
+    print()
+    print(_SEP2)
+    print(f"  DIAGNÓSTICO – SISTEMA DE SINAPSIS HÍBRIDAS")
+    print(_SEP2)
+
+    # ── 1. Elegir cantidad de neuronas ────────────────────────────────────
+    print("\nConfigura el tamaño de la red de prueba:\n")
+    n_animal   = _ask_int("  Neuronas animales",   1, 15, 5)
+    n_micelial = _ask_int("  Neuronas miceliales", 1, 15, 5)
+    n_rounds   = _ask_int("  Rondas de transmisión", 1, 20, 5)
+
+    print(f"\n  → {n_animal} animales · {n_micelial} miceliales · "
+          f"{n_rounds} rondas\n")
+
+    # ── 2. Construir red ──────────────────────────────────────────────────
+    print(_SEP)
+    print("  [1/5] Creando neuronas…")
+    t0 = time.time()
+    animals, micelials = _build_network(n_animal, n_micelial)
+    print(f"       ✓ {len(animals)} animales · {len(micelials)} miceliales "
+          f"({(time.time()-t0)*1000:.1f} ms)")
+
+    # ── 3. Cablear sinapsis ───────────────────────────────────────────────
+    print(_SEP)
+    print("  [2/5] Creando sinapsis…")
+    mgr = SynapseManager(prune_interval_s=10.0,
+                          utility_threshold=0.10,
+                          error_rate_max=0.75,
+                          inactivity_secs=60.0)
+    t0 = time.time()
+    wire_report = _wire_network(mgr, animals, micelials)
+    stats = mgr.get_stats()
+    print(f"       ✓ {stats['total_synapses']} sinapsis  "
+          f"({wire_report['electrical']} eléctricas · "
+          f"{wire_report['chemical']} químicas · "
+          f"{wire_report['hybrid']} híbridas)")
+    print(f"         {wire_report['bundles']} bundles paralelos · "
+          f"{wire_report['chains']} cadenas seriales "
+          f"({(time.time()-t0)*1000:.1f} ms)")
+
+    # ── 4. Transmisiones ──────────────────────────────────────────────────
+    print(_SEP)
+    print(f"  [3/5] Ejecutando {n_rounds} rondas de transmisión…")
+    t0 = time.time()
+    tx_report = _run_transmissions(mgr, animals, micelials, n_rounds)
+    elapsed   = (time.time() - t0) * 1000
+    sr = tx_report["successful"] / max(1, tx_report["total_tx"]) * 100
+    print(f"       ✓ {tx_report['total_tx']} transmisiones  "
+          f"({tx_report['successful']} ✓  {tx_report['failed']} ✗  "
+          f"tasa_éxito={sr:.1f}%)  [{elapsed:.1f} ms]")
+
+    # ── 5. Plasticidad: verificar cambios de peso ─────────────────────────
+    print(_SEP)
+    print("  [4/5] Analizando plasticidad sináptica…")
+    with mgr.lock:
+        syns_snap = [(s.synapse_id, s.weight, s.kind.value)
+                     for s in mgr.synapses.values()]
+    changed  = sum(1 for _, w, _ in syns_snap if abs(w - 1.0) > 0.01)
+    avg_w    = sum(w for _, w, _ in syns_snap) / max(1, len(syns_snap))
+    min_w    = min((w for _, w, _ in syns_snap), default=0)
+    max_w    = max((w for _, w, _ in syns_snap), default=0)
+    print(f"       ✓ {changed}/{len(syns_snap)} sinapsis modificaron su peso")
+    print(f"         peso promedio={avg_w:.4f}  min={min_w:.4f}  max={max_w:.4f}")
+
+    # ── 6. Poda ───────────────────────────────────────────────────────────
+    print(_SEP)
+    print("  [5/5] Ejecutando ciclo de poda inteligente…")
+    prune_report = mgr.prune(force=True)
+    print(f"       ✓ Evaluadas={prune_report['evaluated']}  "
+          f"Podadas={prune_report['pruned']}  "
+          f"Persistentes conservadas={prune_report['persistent_kept']}")
+    if prune_report["reasons"]:
+        for reason, count in prune_report["reasons"].items():
+            print(f"         • {reason}: {count}")
+
+    # ── 7. Tabla de sinapsis ──────────────────────────────────────────────
+    final_stats = mgr.get_stats()
+    print()
+    print(_SEP2)
+    print("  ESTADO FINAL DE SINAPSIS")
+    print(_SEP2)
+    print(f"  Total: {final_stats['total_synapses']}  "
+          f"Activas: {final_stats['active_synapses']}  "
+          f"Inactivas: {final_stats['inactive_synapses']}")
+    print(f"  Por tipo:     {final_stats['by_kind']}")
+    print(f"  Por polaridad:{final_stats['by_polarity']}")
+    print(f"  Peso: avg={final_stats['avg_weight']}  "
+          f"min={final_stats['min_weight']}  max={final_stats['max_weight']}")
+    print(f"  Utilidad promedio: {final_stats['avg_utility']}")
+    print(f"  Bundles paralelos: {final_stats['bundles']}  "
+          f"Cadenas seriales: {final_stats['chains']}")
+    print()
+
+    syn_list = mgr.list_synapses()
+    if syn_list:
+        print(_SEP)
+        print(f"  {'ID':<14} {'Tipo':<12} {'Pol':<11} "
+              f"{'Peso':>6} {'Edad':>6} {'OK':>4} {'ERR':>4} "
+              f"{'Err%':>5} {'Pers':>5}")
+        print(_SEP)
+        for s in syn_list[:30]:   # máximo 30 filas
+            total = s["success"] + s["failure"]
+            err_p = f"{s['error_rate']*100:.0f}%" if total > 0 else "─"
+            pers  = "✓" if s["persistent"] else "─"
+            actv  = "✓" if s["active"] else "✗"
+            print(f"  {s['id']:<14} {s['kind']:<12} {s['polarity']:<11} "
+                  f"{s['weight']:>6.3f} {s['age_s']:>5.1f}s "
+                  f"{s['success']:>4} {s['failure']:>4} "
+                  f"{err_p:>5} {pers:>5}")
+        if len(syn_list) > 30:
+            print(f"  … y {len(syn_list)-30} sinapsis más (omitidas)")
+
+    # ── 8. Resumen ejecutivo ──────────────────────────────────────────────
+    print()
+    print(_SEP2)
+    print("  RESUMEN EJECUTIVO")
+    print(_SEP2)
+    health = "ÓPTIMO"
+    if sr < 50:  health = "CRÍTICO"
+    elif sr < 75: health = "ADVERTENCIA"
+    elif sr < 90: health = "ESTABLE"
+
+    print(f"  Estado:          {health}")
+    print(f"  Neuronas:        {len(animals)} animales  +  {len(micelials)} miceliales")
+    print(f"  Sinapsis finales:{final_stats['total_synapses']}")
+    print(f"  Tasa de éxito:   {sr:.1f}%")
+    print(f"  Podadas total:   {final_stats['total_pruned_ever']}")
+    print(f"  Plasticidad:     {changed} sinapsis modificadas de {len(syns_snap)}")
+    print()
+    print("  ✓ Sistema listo para integración híbrida animal-micelial")
+    print(_SEP2)
+    print()
+
+    return mgr, animals, micelials
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PUNTO DE ENTRADA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    try:
+        mgr, animals, micelials = run_diagnostic()
+    except KeyboardInterrupt:
+        print("\n  Diagnóstico interrumpido por el usuario.")
+    except Exception as exc:
+        print(f"\n❌ Error inesperado: {exc}")
         traceback.print_exc()
