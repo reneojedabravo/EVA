@@ -681,7 +681,7 @@ class MetaLearner:
 
 _LEARN_ANIMAL = [
     ("anomaly_detector",          {}),
-    ("associative_memory_cell",   {}),
+    ("risk_assessor",             {}),
     ("decision_maker",            {}),
     ("dopaminergic_modulator",    {}),
     ("mirror_neuron",             {"action_class": "learn"}),
