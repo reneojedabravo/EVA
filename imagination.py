@@ -252,7 +252,7 @@ class Scenario:
 _IMAG_ANIMAL = [
     ("visual_feature_extractor",  {"feature_type": "shape"}),
     ("anomaly_detector",          {}),
-    ("associative_memory_cell",   {}),
+    ("risk_assessor",             {}),
     ("decision_maker",            {}),
     ("dopaminergic_modulator",    {}),
     ("mirror_neuron",             {"action_class": "imagine"}),
